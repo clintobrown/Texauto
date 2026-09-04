@@ -1,631 +1,109 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TEXAUTOMATE</title>
-<style>
-  :root{
-    --bg:#07090d; --panel:#0e131a; --edge:#1a2430; --line:#1f2b38;
-    --text:#dbe5ec; --dim:#5f7387; --hot:#ff8a3d; --go:#3ddc97;
-    --warn:#ffc247; --stop:#ff4d4d; --mono:'JetBrains Mono','SF Mono',Consolas,monospace;
-    --sans:'Inter',-apple-system,sans-serif;
-  }
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;padding:18px 14px 40px}
-  .shell{max-width:760px;margin:0 auto}
+/**
+ * Texautomate → Jira proxy
+ *
+ * Deploy this as a Cloudflare Worker. It's the only thing that ever sees
+ * your Jira email + API token — the browser page never has them.
+ *
+ * SETUP (Cloudflare dashboard, no CLI needed):
+ * 1. cloudflare.com → sign up / log in (free tier is plenty)
+ * 2. Workers & Pages → Create → "Create Worker" → give it a name (e.g. texauto-jira-proxy)
+ * 3. It opens the online editor — delete the placeholder code, paste this whole file in, Save.
+ * 4. Go to Settings → Variables → "Add variable" three times, marking each as
+ *    "Encrypt" (this is what keeps them out of logs/dashboard view):
+ *      JIRA_SITE   = yourcompany.atlassian.net
+ *      JIRA_EMAIL  = you@company.com
+ *      JIRA_TOKEN  = the API token from id.atlassian.com → Security → API tokens
+ * 5. Settings → Variables → also add ALLOWED_ORIGIN = https://clintobrown.github.io
+ *    (locks the proxy so only your page can call it — not required as "Encrypt")
+ * 6. Deploy. Copy the worker's URL (looks like
+ *    https://texauto-jira-proxy.<your-subdomain>.workers.dev) into the
+ *    "PROXY URL" field in Texautomate's Jira Connection panel.
+ *
+ * That's it — no server to maintain, free for this volume of traffic.
+ */
 
-  header{border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:18px;
-    display:flex;align-items:center;justify-content:space-between;gap:12px}
-  .wordmark{font-family:var(--mono);font-size:19px;font-weight:600;letter-spacing:-0.02em}
-  .wordmark b{color:var(--hot);font-weight:600}
-  .mode{font-family:var(--mono);font-size:10px;letter-spacing:.12em;padding:4px 8px;border-radius:2px;
-    border:1px solid var(--warn);color:var(--warn)}
-  .mode.live{border-color:var(--stop);color:var(--stop)}
+export default {
+  async fetch(request, env) {
+    const origin = env.ALLOWED_ORIGIN || "*";
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
 
-  /* mic */
-  .mic-wrap{display:flex;flex-direction:column;align-items:center;gap:12px;
-    padding:26px 16px;border:1px solid var(--edge);border-radius:6px;background:var(--panel)}
-  .mic{width:88px;height:88px;border-radius:50%;border:2px solid var(--edge);background:#121922;
-    display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.18s;
-    font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.08em;text-align:center;line-height:1.3}
-  .mic.listening{border-color:var(--go);color:var(--go);box-shadow:0 0 0 6px rgba(61,220,151,.09)}
-  .mic.armed{border-color:var(--hot);color:var(--hot);box-shadow:0 0 0 6px rgba(255,138,61,.12)}
-  .heard{font-family:var(--mono);font-size:12.5px;color:var(--dim);text-align:center;min-height:18px;
-    max-width:100%;word-break:break-word}
-  .heard em{color:var(--text);font-style:normal}
-  .wake-hint{font-family:var(--mono);font-size:10.5px;color:var(--dim);letter-spacing:.06em}
-  .wake-hint b{color:var(--hot);font-weight:500}
-
-  .typed{display:flex;gap:8px;margin-top:12px;width:100%}
-  .typed input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--text);
-    font-family:var(--mono);font-size:13px;padding:10px 12px;border-radius:3px;outline:none}
-  .typed input:focus{border-color:var(--hot)}
-  .typed button{background:var(--hot);color:#0a0a0a;border:none;font-family:var(--mono);font-size:12px;
-    font-weight:600;padding:10px 14px;border-radius:3px;cursor:pointer}
-
-  section.card{border:1px solid var(--edge);border-radius:6px;background:var(--panel);margin-top:16px;overflow:hidden}
-  .card-head{display:flex;align-items:baseline;justify-content:space-between;padding:12px 15px;
-    border-bottom:1px solid var(--line)}
-  .card-head h2{font-family:var(--mono);font-size:11px;letter-spacing:.13em;color:var(--dim);font-weight:500}
-  .card-head .meta{font-family:var(--mono);font-size:10.5px;color:var(--dim)}
-  .card-body{padding:14px 15px}
-
-  /* confirm panel */
-  .confirm{border:1px solid var(--warn);border-radius:6px;background:rgba(255,194,71,.05);
-    padding:15px;margin-top:16px}
-  .confirm .label{font-family:var(--mono);font-size:10px;letter-spacing:.13em;color:var(--warn);margin-bottom:9px}
-  .readback{font-size:15px;line-height:1.55}
-  .readback .v{font-family:var(--mono);color:var(--hot);font-weight:600}
-  .parsed{margin-top:12px;padding-top:11px;border-top:1px solid var(--line);
-    font-family:var(--mono);font-size:11.5px;color:var(--dim);line-height:1.85}
-  .parsed .k{color:var(--dim)}
-  .parsed .val{color:var(--text)}
-  .parsed .miss{color:var(--stop)}
-  .confirm-actions{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap}
-  .btn{font-family:var(--mono);font-size:12px;font-weight:600;padding:11px 15px;border-radius:3px;
-    cursor:pointer;border:none;letter-spacing:.03em}
-  .btn.go{background:var(--go);color:#06120c}
-  .btn.cancel{background:transparent;border:1px solid var(--line);color:var(--dim)}
-  .btn:disabled{background:var(--edge);color:var(--dim);cursor:not-allowed}
-
-  /* log */
-  .entry{padding:11px 15px;border-bottom:1px solid var(--line);display:flex;gap:11px;align-items:flex-start}
-  .entry:last-child{border-bottom:none}
-  .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:6px}
-  .dot.ok{background:var(--go)} .dot.dry{background:var(--warn)} .dot.err{background:var(--stop)}
-  .entry-main{flex:1;min-width:0}
-  .entry-cmd{font-size:13px;line-height:1.45}
-  .entry-sub{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:3px}
-
-  /* config */
-  .field{margin-bottom:11px}
-  .field label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.1em;
-    color:var(--dim);margin-bottom:5px}
-  .field input,.field select{width:100%;background:var(--bg);border:1px solid var(--line);
-    color:var(--text);font-family:var(--mono);font-size:12.5px;padding:9px 10px;border-radius:3px;outline:none}
-  .field input:focus{border-color:var(--hot)}
-  .note{font-size:11.5px;color:var(--dim);line-height:1.5;margin-top:10px}
-  .toggle-row{display:flex;align-items:center;gap:10px;margin-top:14px;padding-top:13px;
-    border-top:1px solid var(--line)}
-  .sw{width:42px;height:23px;border-radius:12px;background:var(--edge);position:relative;
-    cursor:pointer;transition:.18s;flex-shrink:0}
-  .sw.on{background:var(--stop)}
-  .sw::after{content:'';position:absolute;top:3px;left:3px;width:17px;height:17px;border-radius:50%;
-    background:var(--text);transition:.18s}
-  .sw.on::after{transform:translateX(19px)}
-  .sw-label{font-family:var(--mono);font-size:11.5px;color:var(--dim)}
-
-  .grammar{font-family:var(--mono);font-size:11.5px;line-height:1.9;color:var(--dim)}
-  .grammar b{color:var(--hot);font-weight:500}
-  .empty{padding:20px 15px;text-align:center;color:var(--dim);font-size:12.5px}
-  .disclosure{margin-top:18px;font-size:11px;color:var(--dim);line-height:1.6;
-    border-top:1px solid var(--line);padding-top:14px}
-</style>
-</head>
-<body>
-<div class="shell">
-
-<header>
-  <div class="wordmark">TEX<b>AUTOMATE</b></div>
-  <div class="mode" id="modeBadge">DRY RUN</div>
-</header>
-
-<div class="mic-wrap">
-  <div class="mic" id="mic">TAP<br>TO ARM</div>
-  <div class="wake-hint">say <b>"Texautomate"</b> then your command</div>
-  <div class="heard" id="heard"></div>
-  <div id="diag" style="font-family:var(--mono);font-size:10.5px;line-height:1.7;text-align:center;color:var(--dim);max-width:100%"></div>
-  <div class="typed">
-    <input id="typedIn" placeholder="or type a command..." autocomplete="off">
-    <button id="typedGo">RUN</button>
-  </div>
-</div>
-
-<div id="confirmHost"></div>
-
-<section class="card">
-  <div class="card-head"><h2>ACTIVITY</h2><span class="meta" id="logMeta">0</span></div>
-  <div id="logList"><div class="empty">No commands yet.</div></div>
-</section>
-
-<section class="card">
-  <div class="card-head"><h2>COMMANDS</h2><span class="meta" id="cmdCount"></span></div>
-  <div class="card-body"><div class="grammar" id="grammarList"></div></div>
-</section>
-
-<section class="card">
-  <div class="card-head"><h2>JIRA CONNECTION</h2><span class="meta">personal token</span></div>
-  <div class="card-body">
-    <div class="field">
-      <label>SITE</label>
-      <input id="cfgSite" placeholder="yourcompany.atlassian.net">
-    </div>
-    <div class="field">
-      <label>EMAIL</label>
-      <input id="cfgEmail" placeholder="you@company.com">
-    </div>
-    <div class="field">
-      <label>API TOKEN</label>
-      <input id="cfgToken" type="password" placeholder="from id.atlassian.com">
-    </div>
-    <div class="field">
-      <label>PROJECT KEY</label>
-      <input id="cfgProject" placeholder="VOPS">
-    </div>
-    <div class="field">
-      <label>SERVICE HOLD ISSUE TYPE</label>
-      <input id="cfgIssueType" placeholder="Task">
-    </div>
-    <div class="toggle-row">
-      <div class="sw" id="liveSw"></div>
-      <div class="sw-label" id="liveLabel">Dry run — nothing is sent</div>
-    </div>
-    <div class="note" id="cfgNote"></div>
-    <div class="note" id="proxyNote" style="margin-top:6px"></div>
-  </div>
-</section>
-
-<div class="disclosure">
-  Commands are parsed locally and always read back for confirmation before anything is sent — voice
-  transcription confuses similar digits, and 604 versus 614 is one phoneme apart. Placing a hold is
-  one step. Clearing one is deliberately not a voice command; take a defective asset out of service
-  fast, put it back only by hand.
-  <br><br>
-  Config is held in memory only and is lost on refresh, so your token is never written to disk by
-  this page. Wire it to a keychain or env var when you host it yourself.
-</div>
-
-</div>
-
-<script>
-// ---------- state ----------
-const cfg = { site:"", email:"", token:"", project:"", issueType:"Task", live:false };
-let pending = null;      // parsed command awaiting confirmation
-const log = [];
-let recognizing = false, armed = false, recog = null;
-
-// ---------- asset vocabulary ----------
-// Spoken digits are unreliable, so assets are validated against a known list
-// rather than accepted as free text.
-const KNOWN_ASSETS = ["601","602","603","604","605","606","610","611","612","614","620","621","630"];
-
-// ---------- command registry ----------
-// Each command is a pattern + extractor. Add entries here as the tool grows.
-const COMMANDS = [
-  {
-    id:"service_hold",
-    say:"put truck <asset> in a service hold for <reason>",
-    verb:"Service hold",
-    match:/(?:put\s+)?(?:truck|tractor|unit)?\s*(\d{3})\b.*?(?:service hold|out of service|oos|down)\s*(?:for|because of|due to)?\s*(.*)/i,
-    build:(m)=>({ asset:m[1], reason:(m[2]||"").trim() }),
-    require:["asset","reason"],
-    fields:(p)=>({
-      summary:`Service hold — Truck ${p.asset} — ${titleCase(p.reason)}`,
-      description:`Asset ${p.asset} placed in service hold.\n\nReason: ${p.reason}\n\nRaised via Texautomate voice command.`,
-      labels:["service-hold","texautomate"]
-    })
-  },
-  {
-    id:"log_fault",
-    say:"log a fault on truck <asset> <description>",
-    verb:"Fault report",
-    match:/(?:log|report|open)\s+(?:a\s+)?(?:fault|issue|defect)\s+(?:on\s+)?(?:truck|tractor|unit)?\s*(\d{3})\b\s*(?:for|about)?\s*(.*)/i,
-    build:(m)=>({ asset:m[1], reason:(m[2]||"").trim() }),
-    require:["asset","reason"],
-    fields:(p)=>({
-      summary:`Fault — Truck ${p.asset} — ${titleCase(p.reason)}`,
-      description:`Fault reported on asset ${p.asset}.\n\nDetail: ${p.reason}\n\nRaised via Texautomate voice command.`,
-      labels:["fault","texautomate"]
-    })
-  },
-  {
-    id:"note",
-    say:"note <text>",
-    verb:"Shift note",
-    match:/^(?:note|make a note|add note)\s+(.*)/i,
-    build:(m)=>({ reason:(m[1]||"").trim() }),
-    require:["reason"],
-    fields:(p)=>({
-      summary:`Shift note — ${titleCase(p.reason).slice(0,60)}`,
-      description:p.reason + "\n\nRaised via Texautomate voice command.",
-      labels:["note","texautomate"]
-    })
-  }
-];
-
-function titleCase(s){
-  if(!s) return "";
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-// ---------- parsing ----------
-const WAKE = /^\s*tex\s*automate\b[,:]?\s*/i;
-
-function stripWake(text){
-  return text.replace(WAKE, "");
-}
-function hasWake(text){
-  return WAKE.test(text) || /^\s*tex\s+automate/i.test(text);
-}
-
-function parseCommand(raw){
-  const text = raw.trim();
-  for(const c of COMMANDS){
-    const m = text.match(c.match);
-    if(m){
-      const p = c.build(m);
-      const missing = c.require.filter(k => !p[k]);
-      // unknown asset numbers are almost always mis-transcription
-      let assetWarning = null;
-      if(p.asset && !KNOWN_ASSETS.includes(p.asset)){
-        assetWarning = `Truck ${p.asset} is not in the known asset list`;
-      }
-      return { cmd:c, parsed:p, missing, assetWarning, raw:text };
+    // Browsers send an OPTIONS preflight before the real POST — answer it.
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
     }
-  }
-  return null;
-}
 
-// ---------- confirm UI ----------
-function showConfirm(result){
-  pending = result;
-  const host = document.getElementById("confirmHost");
-  if(!result){
-    host.innerHTML = "";
-    return;
-  }
-  const { cmd, parsed, missing, assetWarning } = result;
-  const f = cmd.fields(parsed);
-  const blocked = missing.length > 0;
-
-  const readback = parsed.asset
-    ? `${cmd.verb} on truck <span class="v">${parsed.asset}</span>${parsed.reason ? ` for <span class="v">${parsed.reason}</span>` : ""}.`
-    : `${cmd.verb}: <span class="v">${parsed.reason || "—"}</span>`;
-
-  host.innerHTML = `
-    <div class="confirm">
-      <div class="label">CONFIRM BEFORE SENDING</div>
-      <div class="readback">${readback}</div>
-      <div class="parsed">
-        <div><span class="k">action</span> &nbsp;<span class="val">${cmd.id}</span></div>
-        ${parsed.asset ? `<div><span class="k">asset</span> &nbsp;<span class="${assetWarning?'miss':'val'}">${parsed.asset}${assetWarning?" ⚠":""}</span></div>` : ""}
-        ${missing.map(k=>`<div><span class="k">${k}</span> &nbsp;<span class="miss">missing — say it again</span></div>`).join("")}
-        <div><span class="k">summary</span> &nbsp;<span class="val">${f.summary}</span></div>
-        <div><span class="k">target</span> &nbsp;<span class="val">${cfg.project || "(no project set)"} / ${cfg.issueType || "Task"}</span></div>
-        ${assetWarning ? `<div style="color:var(--stop);margin-top:6px;">${assetWarning} — check the number before sending.</div>` : ""}
-      </div>
-      <div class="confirm-actions">
-        <button class="btn go" id="doIt" ${blocked?"disabled":""}>
-          ${cfg.live ? "CREATE IN JIRA" : "SIMULATE"}
-        </button>
-        <button class="btn cancel" id="cancelIt">DISCARD</button>
-      </div>
-    </div>`;
-
-  document.getElementById("cancelIt").onclick = ()=>{ showConfirm(null); setHeard(""); };
-  const go = document.getElementById("doIt");
-  if(go && !blocked) go.onclick = execute;
-}
-
-// ---------- execution ----------
-async function execute(){
-  if(!pending) return;
-  const { cmd, parsed } = pending;
-  const f = cmd.fields(parsed);
-  const btn = document.getElementById("doIt");
-  if(btn){ btn.disabled = true; btn.textContent = "WORKING..."; }
-
-  if(!cfg.live){
-    addLog("dry", f.summary, "simulated — dry run, nothing sent to Jira");
-    showConfirm(null); setHeard("");
-    return;
-  }
-
-  if(!cfg.site || !cfg.email || !cfg.token || !cfg.project){
-    addLog("err", f.summary, "missing Jira config — fill in site, email, token, project");
-    showConfirm(null);
-    return;
-  }
-
-  const issuePayload = {
-    fields:{
-      project:{ key: cfg.project },
-      issuetype:{ name: cfg.issueType || "Task" },
-      summary: f.summary,
-      labels: f.labels,
-      description:{
-        type:"doc", version:1,
-        content:[{ type:"paragraph", content:[{ type:"text", text:f.description }] }]
-      }
+    if (request.method !== "POST") {
+      return new Response(JSON.stringify({ error: "POST only" }), {
+        status: 405,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
     }
-  };
 
-  // Try the local proxy first (see proxy.js) — it exists specifically to get
-  // around the browser CORS block on direct calls to Jira. If it's not
-  // running, fall back to a direct call, which will surface the CORS error
-  // plainly rather than failing silently.
-  let usedProxy = false;
-  try{
-    const proxyRes = await fetch("http://127.0.0.1:8787/create-issue", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ site:cfg.site, email:cfg.email, token:cfg.token, issue:issuePayload })
-    });
-    usedProxy = true;
-    const data = await proxyRes.json();
-    if(!proxyRes.ok){
-      addLog("err", f.summary, `Jira ${proxyRes.status} via proxy — ${JSON.stringify(data).slice(0,140)}`);
-    } else {
-      addLog("ok", f.summary, `created ${data.key} (via local proxy)`);
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return new Response(JSON.stringify({ error: "invalid JSON body" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
     }
-  } catch(proxyErr){
-    if(!usedProxy){
-      // Proxy not running/reachable — try direct as a last resort.
-      try{
-        const res = await fetch(`https://${cfg.site}/rest/api/3/issue`, {
-          method:"POST",
-          headers:{
-            "Authorization":"Basic " + btoa(`${cfg.email}:${cfg.token}`),
-            "Content-Type":"application/json",
-            "Accept":"application/json"
+
+    const { project, issueType, summary, description, labels } = body;
+    if (!project || !summary) {
+      return new Response(
+        JSON.stringify({ error: "project and summary are required" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    if (!env.JIRA_SITE || !env.JIRA_EMAIL || !env.JIRA_TOKEN) {
+      return new Response(
+        JSON.stringify({ error: "proxy is missing JIRA_SITE / JIRA_EMAIL / JIRA_TOKEN env vars" }),
+        { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    const auth = "Basic " + btoa(`${env.JIRA_EMAIL}:${env.JIRA_TOKEN}`);
+
+    try {
+      const jiraRes = await fetch(`https://${env.JIRA_SITE}/rest/api/3/issue`, {
+        method: "POST",
+        headers: {
+          Authorization: auth,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          fields: {
+            project: { key: project },
+            issuetype: { name: issueType || "Task" },
+            summary,
+            labels: labels || [],
+            description: {
+              type: "doc",
+              version: 1,
+              content: [{ type: "paragraph", content: [{ type: "text", text: description || "" }] }],
+            },
           },
-          body: JSON.stringify(issuePayload)
-        });
-        if(!res.ok){
-          const t = await res.text();
-          addLog("err", f.summary, `Jira ${res.status} — ${t.slice(0,140)}`);
-        } else {
-          const data = await res.json();
-          addLog("ok", f.summary, `created ${data.key}`);
-        }
-      } catch(e){
-        addLog("err", f.summary, `request failed — ${e.message}. No local proxy running (start it with "node proxy.js") and Jira blocks direct browser calls with CORS.`);
-      }
-    } else {
-      addLog("err", f.summary, `proxy call failed — ${proxyErr.message}. Is "node proxy.js" running?`);
+        }),
+      });
+
+      const text = await jiraRes.text();
+
+      return new Response(text, {
+        status: jiraRes.status,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    } catch (err) {
+      return new Response(JSON.stringify({ error: "upstream request failed: " + err.message }), {
+        status: 502,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
     }
-  }
-  showConfirm(null); setHeard("");
-}
-
-function addLog(kind, cmdText, sub){
-  log.unshift({ kind, cmdText, sub, at:new Date() });
-  renderLog();
-}
-function renderLog(){
-  const el = document.getElementById("logList");
-  document.getElementById("logMeta").textContent = log.length;
-  if(!log.length){ el.innerHTML = '<div class="empty">No commands yet.</div>'; return; }
-  el.innerHTML = log.map(e=>`
-    <div class="entry">
-      <div class="dot ${e.kind}"></div>
-      <div class="entry-main">
-        <div class="entry-cmd">${e.cmdText}</div>
-        <div class="entry-sub">${e.at.toLocaleTimeString()} · ${e.sub}</div>
-      </div>
-    </div>`).join("");
-}
-
-// ---------- voice ----------
-function setHeard(t, final){
-  document.getElementById("heard").innerHTML = t ? (final?`<em>${t}</em>`:t) : "";
-}
-
-function handleUtterance(text){
-  setHeard(text, true);
-  let body = text;
-  if(hasWake(text)){
-    body = stripWake(text);
-    armed = true;
-  } else if(!armed){
-    setHeard(`ignored — start with "Texautomate"`);
-    return;
-  }
-  if(!body.trim()){
-    setHeard(`armed — say your command`);
-    document.getElementById("mic").className = "mic armed";
-    return;
-  }
-  const result = parseCommand(body);
-  if(!result){
-    setHeard(`didn't match a known command: "${body}"`);
-    showConfirm(null);
-    return;
-  }
-  armed = false;
-  showConfirm(result);
-}
-
-function diag(msg, color){
-  const el = document.getElementById("diag");
-  el.innerHTML = msg ? '<span style="color:' + (color||'var(--dim)') + '">' + msg + '</span>' : '';
-}
-
-// Report anything that would stop the mic from working before the user taps.
-function preflight(){
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const problems = [];
-  const secure = window.isSecureContext || location.protocol === "https:" || location.hostname === "localhost";
-
-  if(!SR) problems.push("This browser has no Speech Recognition API. Chrome, Edge or Safari required — Firefox does not support it.");
-  if(!secure) problems.push("Page is not on HTTPS or localhost (" + location.protocol + "). Browsers only allow microphone access on secure origins.");
-  if(window.self !== window.top) problems.push("Running inside an iframe. Preview panes usually block microphone access — open this file in its own browser tab.");
-  if(!navigator.mediaDevices) problems.push("navigator.mediaDevices unavailable, so permission cannot be requested.");
-
-  if(problems.length){
-    diag(problems.map(p => "\u26A0 " + p).join("<br>"), "var(--warn)");
-    return false;
-  }
-  diag("voice ready \u00b7 " + location.protocol + "//" + (location.hostname || "local"), "var(--go)");
-  return true;
-}
-
-function initVoice(){
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const mic = document.getElementById("mic");
-  const ok = preflight();
-
-  if(!SR){
-    mic.textContent = "NO VOICE";
-    mic.style.cursor = "not-allowed";
-    setHeard("type commands instead — everything else works");
-    return;
-  }
-
-  function build(){
-    const r = new SR();
-    // continuous is unreliable on iOS Safari; restart on end instead of relying on it
-    r.continuous = true;
-    r.interimResults = true;
-    r.lang = "en-US";
-    r.onresult = (ev)=>{
-      let interim = "", final = "";
-      for(let i=ev.resultIndex;i<ev.results.length;i++){
-        const res = ev.results[i];
-        if(res.isFinal) final += res[0].transcript;
-        else interim += res[0].transcript;
-      }
-      if(interim) setHeard(interim);
-      if(final.trim()) handleUtterance(final.trim());
-    };
-    r.onerror = (e)=>{
-      const map = {
-        "not-allowed":"Microphone permission denied. Allow it in the address-bar icon, then tap again.",
-        "service-not-allowed":"Speech service blocked — usually means the page is not on HTTPS.",
-        "no-speech":"Heard nothing. Tap and speak closer to the mic.",
-        "audio-capture":"No microphone found.",
-        "network":"Speech recognition needs a network connection."
-      };
-      diag("\u26A0 " + (map[e.error] || ("mic error: " + e.error)), "var(--stop)");
-      recognizing = false;
-      mic.className = "mic";
-      mic.innerHTML = "TAP<br>TO ARM";
-    };
-    r.onend = ()=>{
-      if(recognizing){
-        try{ r.start(); }catch(err){
-          diag("\u26A0 could not resume: " + err.message, "var(--stop)");
-          recognizing = false;
-          mic.className = "mic"; mic.innerHTML = "TAP<br>TO ARM";
-        }
-      } else {
-        mic.className = "mic";
-        mic.innerHTML = "TAP<br>TO ARM";
-      }
-    };
-    return r;
-  }
-
-  mic.onclick = async ()=>{
-    if(recognizing){
-      recognizing = false; armed = false;
-      try{ recog && recog.stop(); }catch(_){}
-      diag("stopped");
-      return;
-    }
-
-    // Ask for the mic explicitly so the browser shows its prompt and we can
-    // report a denial instead of failing silently.
-    if(navigator.mediaDevices && navigator.mediaDevices.getUserMedia){
-      diag("requesting microphone...");
-      try{
-        const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
-        stream.getTracks().forEach(t=>t.stop());   // release; SR opens its own
-      } catch(err){
-        diag("\u26A0 microphone blocked: " + err.name + ". Check the permission icon in the address bar.", "var(--stop)");
-        return;
-      }
-    }
-
-    recog = build();
-    try{
-      recog.start();
-      recognizing = true;
-      mic.className = "mic listening";
-      mic.innerHTML = "LISTENING";
-      setHeard('waiting for "Texautomate"');
-      diag("listening \u00b7 say the wake word", "var(--go)");
-    } catch(err){
-      // surfaced, not swallowed
-      diag("\u26A0 could not start: " + err.message, "var(--stop)");
-      recognizing = false;
-    }
-  };
-}
-
-// ---------- config wiring ----------
-function wireConfig(){
-  const map = { cfgSite:"site", cfgEmail:"email", cfgToken:"token", cfgProject:"project", cfgIssueType:"issueType" };
-  Object.entries(map).forEach(([id,key])=>{
-    const el = document.getElementById(id);
-    el.oninput = ()=>{ cfg[key] = el.value.trim(); updateNote(); if(pending) showConfirm(pending); };
-  });
-  const sw = document.getElementById("liveSw");
-  sw.onclick = ()=>{
-    cfg.live = !cfg.live;
-    sw.className = "sw" + (cfg.live?" on":"");
-    document.getElementById("liveLabel").textContent = cfg.live
-      ? "LIVE — commands create real Jira issues"
-      : "Dry run — nothing is sent";
-    const badge = document.getElementById("modeBadge");
-    badge.textContent = cfg.live ? "LIVE" : "DRY RUN";
-    badge.className = "mode" + (cfg.live?" live":"");
-    if(pending) showConfirm(pending);
-  };
-  updateNote();
-}
-function updateNote(){
-  const ready = cfg.site && cfg.email && cfg.token && cfg.project;
-  document.getElementById("cfgNote").innerHTML = ready
-    ? "Config looks complete. Live sends route through the local proxy (proxy.js) to avoid Jira's CORS block; direct browser calls are tried only as a fallback. Dry run works regardless of any of this."
-    : "Get a token at id.atlassian.com → Security → API tokens. It authenticates as you, so this can only do what you can already do.";
-}
-
-// ---------- proxy status ----------
-async function checkProxy(){
-  const el = document.getElementById("proxyNote");
-  try{
-    const res = await fetch("http://127.0.0.1:8787/ping", { method:"GET" });
-    if(res.ok){
-      el.innerHTML = "\u25CF proxy running \u00b7 live sends will route through localhost:8787";
-      el.style.color = "var(--go)";
-    } else {
-      throw new Error("bad status");
-    }
-  } catch(_){
-    el.innerHTML = "\u25CB proxy not detected \u00b7 run <code>node proxy.js</code> before going live, or live sends will hit CORS";
-    el.style.color = "var(--dim)";
-  }
-}
-
-// ---------- grammar display ----------
-function renderGrammar(){
-  document.getElementById("cmdCount").textContent = COMMANDS.length;
-  document.getElementById("grammarList").innerHTML = COMMANDS.map(c=>
-    `<div><b>Texautomate</b> ${c.say.replace(/</g,"&lt;").replace(/>/g,"&gt;")}</div>`
-  ).join("");
-}
-
-// ---------- typed fallback ----------
-document.getElementById("typedGo").onclick = ()=>{
-  const el = document.getElementById("typedIn");
-  const v = el.value.trim();
-  if(!v) return;
-  armed = true;               // typing implies intent, no wake word needed
-  handleUtterance(hasWake(v) ? v : "Texautomate " + v);
-  el.value = "";
+  },
 };
-document.getElementById("typedIn").onkeydown = (e)=>{
-  if(e.key === "Enter") document.getElementById("typedGo").click();
-};
-
-renderGrammar();
-renderLog();
-wireConfig();
-initVoice();
-checkProxy();
-setInterval(checkProxy, 8000);
-</script>
-</body>
-</html>
