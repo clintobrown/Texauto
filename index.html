@@ -138,15 +138,19 @@
   <div class="card-head"><h2>JIRA CONNECTION</h2><span class="meta">personal token</span></div>
   <div class="card-body">
     <div class="field">
+      <label>PROXY URL <span style="color:var(--go)">(recommended)</span></label>
+      <input id="cfgProxy" placeholder="https://texauto-jira-proxy.you.workers.dev">
+    </div>
+    <div class="field">
       <label>SITE</label>
       <input id="cfgSite" placeholder="yourcompany.atlassian.net">
     </div>
     <div class="field">
-      <label>EMAIL</label>
+      <label>EMAIL <span style="color:var(--dim)">(unused if PROXY URL is set)</span></label>
       <input id="cfgEmail" placeholder="you@company.com">
     </div>
     <div class="field">
-      <label>API TOKEN</label>
+      <label>API TOKEN <span style="color:var(--dim)">(unused if PROXY URL is set)</span></label>
       <input id="cfgToken" type="password" placeholder="from id.atlassian.com">
     </div>
     <div class="field">
@@ -162,7 +166,6 @@
       <div class="sw-label" id="liveLabel">Dry run — nothing is sent</div>
     </div>
     <div class="note" id="cfgNote"></div>
-    <div class="note" id="proxyNote" style="margin-top:6px"></div>
   </div>
 </section>
 
@@ -180,7 +183,7 @@
 
 <script>
 // ---------- state ----------
-const cfg = { site:"", email:"", token:"", project:"", issueType:"Task", live:false };
+const cfg = { proxyUrl:"", site:"", email:"", token:"", project:"", issueType:"Task", live:false };
 let pending = null;      // parsed command awaiting confirmation
 const log = [];
 let recognizing = false, armed = false, recog = null;
@@ -322,69 +325,71 @@ async function execute(){
     return;
   }
 
-  if(!cfg.site || !cfg.email || !cfg.token || !cfg.project){
-    addLog("err", f.summary, "missing Jira config — fill in site, email, token, project");
+  if(!cfg.project){
+    addLog("err", f.summary, "missing Jira config — set a project key");
     showConfirm(null);
     return;
   }
 
-  const issuePayload = {
-    fields:{
-      project:{ key: cfg.project },
-      issuetype:{ name: cfg.issueType || "Task" },
-      summary: f.summary,
-      labels: f.labels,
-      description:{
-        type:"doc", version:1,
-        content:[{ type:"paragraph", content:[{ type:"text", text:f.description }] }]
-      }
-    }
+  const payload = {
+    project: cfg.project,
+    issueType: cfg.issueType || "Task",
+    summary: f.summary,
+    description: f.description,
+    labels: f.labels
   };
 
-  // Try the local proxy first (see proxy.js) — it exists specifically to get
-  // around the browser CORS block on direct calls to Jira. If it's not
-  // running, fall back to a direct call, which will surface the CORS error
-  // plainly rather than failing silently.
-  let usedProxy = false;
   try{
-    const proxyRes = await fetch("http://127.0.0.1:8787/create-issue", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json" },
-      body: JSON.stringify({ site:cfg.site, email:cfg.email, token:cfg.token, issue:issuePayload })
-    });
-    usedProxy = true;
-    const data = await proxyRes.json();
-    if(!proxyRes.ok){
-      addLog("err", f.summary, `Jira ${proxyRes.status} via proxy — ${JSON.stringify(data).slice(0,140)}`);
+    let res;
+    if(cfg.proxyUrl){
+      // Recommended path: proxy holds the token, adds CORS headers, forwards to Jira.
+      res = await fetch(cfg.proxyUrl, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify(payload)
+      });
+    } else if(cfg.site && cfg.email && cfg.token){
+      // Fallback: direct browser-to-Jira call. Left in for transparency — Jira
+      // Cloud does not send CORS headers for arbitrary origins, so this will
+      // almost always fail with a network/CORS error, not a Jira error.
+      res = await fetch(`https://${cfg.site}/rest/api/3/issue`, {
+        method:"POST",
+        headers:{
+          "Authorization":"Basic " + btoa(`${cfg.email}:${cfg.token}`),
+          "Content-Type":"application/json",
+          "Accept":"application/json"
+        },
+        body: JSON.stringify({
+          fields:{
+            project:{ key: cfg.project },
+            issuetype:{ name: cfg.issueType || "Task" },
+            summary: f.summary,
+            labels: f.labels,
+            description:{
+              type:"doc", version:1,
+              content:[{ type:"paragraph", content:[{ type:"text", text:f.description }] }]
+            }
+          }
+        })
+      });
     } else {
-      addLog("ok", f.summary, `created ${data.key} (via local proxy)`);
+      addLog("err", f.summary, "set a PROXY URL (recommended), or SITE + EMAIL + TOKEN for the direct fallback");
+      showConfirm(null); setHeard("");
+      return;
     }
-  } catch(proxyErr){
-    if(!usedProxy){
-      // Proxy not running/reachable — try direct as a last resort.
-      try{
-        const res = await fetch(`https://${cfg.site}/rest/api/3/issue`, {
-          method:"POST",
-          headers:{
-            "Authorization":"Basic " + btoa(`${cfg.email}:${cfg.token}`),
-            "Content-Type":"application/json",
-            "Accept":"application/json"
-          },
-          body: JSON.stringify(issuePayload)
-        });
-        if(!res.ok){
-          const t = await res.text();
-          addLog("err", f.summary, `Jira ${res.status} — ${t.slice(0,140)}`);
-        } else {
-          const data = await res.json();
-          addLog("ok", f.summary, `created ${data.key}`);
-        }
-      } catch(e){
-        addLog("err", f.summary, `request failed — ${e.message}. No local proxy running (start it with "node proxy.js") and Jira blocks direct browser calls with CORS.`);
-      }
+
+    if(!res.ok){
+      const t = await res.text();
+      addLog("err", f.summary, `Jira ${res.status} — ${t.slice(0,140)}`);
     } else {
-      addLog("err", f.summary, `proxy call failed — ${proxyErr.message}. Is "node proxy.js" running?`);
+      const data = await res.json();
+      addLog("ok", f.summary, `created ${data.key}`);
     }
+  } catch(e){
+    const hint = cfg.proxyUrl
+      ? "request failed reaching the proxy — check the PROXY URL and that the Worker is deployed."
+      : "request failed — direct browser calls to Jira are almost always blocked by CORS. Set a PROXY URL instead.";
+    addLog("err", f.summary, `${e.message} — ${hint}`);
   }
   showConfirm(null); setHeard("");
 }
@@ -556,7 +561,7 @@ function initVoice(){
 
 // ---------- config wiring ----------
 function wireConfig(){
-  const map = { cfgSite:"site", cfgEmail:"email", cfgToken:"token", cfgProject:"project", cfgIssueType:"issueType" };
+  const map = { cfgProxy:"proxyUrl", cfgSite:"site", cfgEmail:"email", cfgToken:"token", cfgProject:"project", cfgIssueType:"issueType" };
   Object.entries(map).forEach(([id,key])=>{
     const el = document.getElementById(id);
     el.oninput = ()=>{ cfg[key] = el.value.trim(); updateNote(); if(pending) showConfirm(pending); };
@@ -576,27 +581,13 @@ function wireConfig(){
   updateNote();
 }
 function updateNote(){
-  const ready = cfg.site && cfg.email && cfg.token && cfg.project;
-  document.getElementById("cfgNote").innerHTML = ready
-    ? "Config looks complete. Live sends route through the local proxy (proxy.js) to avoid Jira's CORS block; direct browser calls are tried only as a fallback. Dry run works regardless of any of this."
-    : "Get a token at id.atlassian.com → Security → API tokens. It authenticates as you, so this can only do what you can already do.";
-}
-
-// ---------- proxy status ----------
-async function checkProxy(){
-  const el = document.getElementById("proxyNote");
-  try{
-    const res = await fetch("http://127.0.0.1:8787/ping", { method:"GET" });
-    if(res.ok){
-      el.innerHTML = "\u25CF proxy running \u00b7 live sends will route through localhost:8787";
-      el.style.color = "var(--go)";
-    } else {
-      throw new Error("bad status");
-    }
-  } catch(_){
-    el.innerHTML = "\u25CB proxy not detected \u00b7 run <code>node proxy.js</code> before going live, or live sends will hit CORS";
-    el.style.color = "var(--dim)";
-  }
+  const viaProxy = cfg.proxyUrl && cfg.project;
+  const viaDirect = cfg.site && cfg.email && cfg.token && cfg.project;
+  document.getElementById("cfgNote").innerHTML = viaProxy
+    ? "Config looks complete — sending through your proxy. The proxy holds your email/token; this page never sees them."
+    : viaDirect
+      ? "Config looks complete, but no PROXY URL is set — direct browser calls to Jira almost always fail CORS. Deploy the Cloudflare Worker proxy and paste its URL above."
+      : "Set a PROXY URL (recommended — deploy the included Worker) or fill in SITE + EMAIL + TOKEN for the direct fallback. Get a token at id.atlassian.com → Security → API tokens.";
 }
 
 // ---------- grammar display ----------
@@ -624,8 +615,6 @@ renderGrammar();
 renderLog();
 wireConfig();
 initVoice();
-checkProxy();
-setInterval(checkProxy, 8000);
 </script>
 </body>
 </html>
